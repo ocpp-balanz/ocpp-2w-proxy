@@ -52,7 +52,7 @@ class OCPP2WProxy:
         self.charger_id = charger_id
 
         # Chech that charger id looks reasonable
-        if not charger_id.isalnum():
+        if not all(c.isalnum() or c in '-_' for c in charger_id):
             logger.error(f"Charger ID '{charger_id}' is not alphanumeric")
             raise Exception("Charger ID is not alphanumeric")
 
@@ -180,7 +180,7 @@ class OCPP2WProxy:
                         self.primary_call_ids.remove(message_id)
                         await self.primary_connection.send(message)
                     elif message_id in self.secondary_call_ids:
-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
+                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary: {message_id} {message_type} {message}")
                         self.secondary_call_ids.remove(message_id)
                         await self.secondary_connection.send(message)
                     else:
@@ -238,7 +238,7 @@ class OCPP2WProxy:
 
 # Connection handler (charger connects)
 async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
-    logger.debug('Connection request', websocket.request)
+    logger.debug('Connection request %', websocket.request)
     # Determine charger_id (final part of path)
     path = websocket.request.path
     charger_id = path.strip("/")
