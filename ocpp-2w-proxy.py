@@ -180,7 +180,7 @@ class OCPP2WProxy:
                         self.primary_call_ids.remove(message_id)
                         await self.primary_connection.send(message)
                     elif message_id in self.secondary_call_ids:
-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary: {message_id} {message_type} {message}")
+                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
                         self.secondary_call_ids.remove(message_id)
                         await self.secondary_connection.send(message)
                     else:
