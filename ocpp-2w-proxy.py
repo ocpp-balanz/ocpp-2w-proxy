@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Tuple
 import json
+from typing import Any, Optional
 
 import websockets
 import websockets.asyncio
@@ -33,6 +34,32 @@ class OCPPMessageType(IntEnum):
     CallResult = 3
     CallError = 4
 
+
+class Message:
+    """Decode an OCPP message from a string"""
+    type_: OCPPMessageType
+    id: str
+    action: Optional[str]
+    payload: dict[str, Any]
+
+    def __init__(self, raw: str) -> None:
+        j = json.loads(raw)
+        self.type_ = j[0]
+        self.id = j[1]
+        if self.type_ == OCPPMessageType.Call:
+            self.action = j[2]
+            self.payload = j[3]
+        else:
+            self.action = None
+            self.payload = j[2]
+
+    def serialize(self) -> str:
+        if self.type_ == OCPPMessageType.Call:
+            return json.dumps([self.type_, self.id, self.action, self.payload])
+        else:
+            return json.dumps([self.type_, self.id, self.payload])
+
+
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
@@ -59,6 +86,9 @@ class OCPP2WProxy:
         # Initialize table of CSMS call ids sent to the charger in order to respond back 
         self.primary_call_ids = set()
         self.secondary_call_ids = set()
+
+        # munge transactionId for secondary
+        self.secondary_transactionId = None
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
@@ -173,7 +203,12 @@ class OCPP2WProxy:
                 if message_type == OCPPMessageType.Call:
                     await self.primary_connection.send(message)
                     if self.secondary_connection:
-                        await self.secondary_connection.send(message)
+                        msg = Message(message)
+                        if 'transactionId' in msg.payload and self.secondary_transactionId:
+                            msg.payload['transactionId'] = self.secondary_transactionId
+                            await self.secondary_connection.send(msg.serialize())
+                        else:
+                            await self.secondary_connection.send(message)
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
                     if message_id in self.primary_call_ids:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
@@ -220,6 +255,10 @@ class OCPP2WProxy:
                     self.secondary_call_ids.add(message_id)
                     # Send it to the charger
                     await self.ws.send(message) 
+                elif message_type == OCPPMessageType.CallResult:
+                    msg = Message(message)
+                    if 'transactionId' in msg.payload:
+                        self.secondary_transactionId = msg.payload['transactionId']
                 # Note! We do not forward CallResults or CallErrors from the secondary server
                 # These are silently ignored.
         except Exception as e:
