@@ -14,6 +14,7 @@ from enum import IntEnum
 import ssl
 import argparse
 import configparser
+import re
 
 __version__ = "0.1.0"
 
@@ -33,6 +34,14 @@ class OCPPMessageType(IntEnum):
     CallResult = 3
     CallError = 4
 
+# Characters accepted in a charger ID (last segment of the websocket path)
+CHARGER_ID_RE = re.compile(r"[A-Za-z0-9\-_.:@~]+")
+
+# OCPP subprotocols offered to chargers. The one negotiated with the charger is
+# used for the upstream connections as well.
+SUBPROTOCOLS = ["ocpp1.6", "ocpp2.0.1", "ocpp2.1"]
+DEFAULT_SUBPROTOCOL = "ocpp1.6"
+
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
@@ -51,10 +60,12 @@ class OCPP2WProxy:
         self.ws = websocket
         self.charger_id = charger_id
 
-        # Chech that charger id looks reasonable
-        if not charger_id.isalnum():
-            logger.error(f"Charger ID '{charger_id}' is not alphanumeric")
-            raise Exception("Charger ID is not alphanumeric")
+        # Check that charger id looks reasonable. Many chargers use IDs such as
+        # "GaroCS-4133AAAA46980" or "wallbox_2", so allow the usual URL-safe
+        # characters, not just alphanumerics.
+        if not charger_id or not CHARGER_ID_RE.fullmatch(charger_id):
+            logger.error(f"Charger ID '{charger_id}' contains unsupported characters (allowed: letters, digits, - _ . : @ ~)")
+            raise Exception("Charger ID contains unsupported characters")
 
         # Initialize table of CSMS call ids sent to the charger in order to respond back 
         self.primary_call_ids = set()
@@ -91,8 +102,11 @@ class OCPP2WProxy:
         if "Authorization" in self.ws.request.headers:
             headers["Authorization"] = self.ws.request.headers["Authorization"]
             logger.debug(f'Authorization header set to {headers["Authorization"]}')
-        user_agent = self.ws.request.headers.get("User-Agent", None) 
-        subprotocols = self.ws.request.headers.get("Sec-WebSocket-Protocol", ["ocpp1.6"])
+        user_agent = self.ws.request.headers.get("User-Agent", None)
+        # Use the subprotocol negotiated with the charger (chargers may offer several,
+        # e.g. "ocpp1.6, ocpp2.0.1", or none at all - then we default to ocpp1.6)
+        subprotocol = self.ws.subprotocol or DEFAULT_SUBPROTOCOL
+        logger.debug(f"{self.charger_id} using subprotocol {subprotocol}")
         primary_url = config.get("ext-server", "server") + "/" + self.charger_id
         if config.has_option("ext-server", "secondary_server"):
             secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
@@ -104,7 +118,7 @@ class OCPP2WProxy:
                 uri=primary_url,
                 user_agent_header=user_agent,
                 additional_headers=headers,
-                subprotocols=[subprotocols],
+                subprotocols=[subprotocol],
             )
             logger.info(f"Connected to primary server @ {primary_url}")
 
@@ -114,7 +128,7 @@ class OCPP2WProxy:
                     uri=secondary_url,
                     user_agent_header=user_agent,
                     additional_headers=headers,
-                    subprotocols=[subprotocols],
+                    subprotocols=[subprotocol],
                 )
                 logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
             else:
@@ -156,6 +170,9 @@ class OCPP2WProxy:
         finally:
             # Always close stuff. close is well tempered, so can close even if not stablished
             await self.close()
+            # Remove ourselves from the list, unless a newer instance already replaced us
+            if OCPP2WProxy.proxy_list.get(self.charger_id) is self:
+                del OCPP2WProxy.proxy_list[self.charger_id]
 
     async def receive_charger_messages(self):
         try:
@@ -238,11 +255,12 @@ class OCPP2WProxy:
 
 # Connection handler (charger connects)
 async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
-    logger.debug('Connection request', websocket.request)
-    # Determine charger_id (final part of path)
-    path = websocket.request.path
-    charger_id = path.strip("/")
-    logger.info(f'{charger_id} connection request')
+    logger.debug(f'Connection request {websocket.request}')
+    # Determine charger_id (final part of path). Chargers may be configured with a
+    # path prefix such as ws://host:8321/ocpp/<id>, so only the last segment counts.
+    path = websocket.request.path.split("?")[0].strip("/")
+    charger_id = path[path.rfind("/") + 1:]
+    logger.info(f'{charger_id} connection request (path {websocket.request.path})')
 
     try:
         # Delete any existing charger setup
@@ -259,7 +277,24 @@ async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
     except Exception as e:
         logger.error(f'{charger_id} Error creating OCPP2WProxy: {e}')
     finally:
-        logger.info("f{charger_id} closed/done")
+        logger.info(f"{charger_id} closed/done")
+
+
+def select_subprotocol(connection, subprotocols):
+    """Pick the OCPP subprotocol for a charger connection.
+
+    Chargers that do not send a Sec-WebSocket-Protocol header would otherwise be
+    rejected by websockets with "missing subprotocol". Accept them without a
+    subprotocol (the proxy then talks ocpp1.6 upstream), as the Home Assistant OCPP
+    integration does. Chargers offering several versions get the first one we support."""
+    if not subprotocols:
+        return None
+    for candidate in SUBPROTOCOLS:
+        if candidate in subprotocols:
+            return candidate
+    raise websockets.exceptions.NegotiationError(
+        f"charger offered unsupported subprotocol(s) {list(subprotocols)}; expected one of {SUBPROTOCOLS}"
+    )
 
 
 # Main. Decode arguments, setup handler
@@ -300,7 +335,8 @@ async def main():
             on_connect,
             host,
             port,
-            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+            subprotocols=SUBPROTOCOLS,
+            select_subprotocol=select_subprotocol,
             ssl=ssl_context,
             ping_timeout=config.getint("host", "ping_timeout"),
         )
@@ -309,7 +345,8 @@ async def main():
             on_connect,
             host,
             port,
-            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+            subprotocols=SUBPROTOCOLS,
+            select_subprotocol=select_subprotocol,
             ping_timeout=config.getint("host", "ping_timeout"),
         )
 

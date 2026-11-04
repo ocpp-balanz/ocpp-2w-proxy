@@ -1,3 +1,3 @@
 cryptography
 pydantic==1.*
-websockets
+websockets>=14
