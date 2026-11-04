@@ -18,6 +18,11 @@ The rules are as follows:
 
 The proxy will also keep a watch dog of stale connections. If a connection is not seen for more than `watchdog_stale` seconds, the connection will be closed and removed from the list.
 
+The secondary server is treated as optional at runtime: if it cannot be reached, or the connection to it is lost,
+the charger keeps talking to the primary server and the proxy reconnects to the secondary in the background
+(backoff starting at `secondary_reconnect_min` seconds, doubling up to `secondary_reconnect_max`). Losing the
+primary server still ends the session, so the charger reconnects.
+
 
 ## Usage
 

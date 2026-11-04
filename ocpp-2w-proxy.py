@@ -42,6 +42,11 @@ CHARGER_ID_RE = re.compile(r"[A-Za-z0-9\-_.:@~]+")
 SUBPROTOCOLS = ["ocpp1.6", "ocpp2.0.1", "ocpp2.1"]
 DEFAULT_SUBPROTOCOL = "ocpp1.6"
 
+# Reconnect backoff (seconds) for a lost secondary connection. Overridable in the
+# ini file via secondary_reconnect_min / secondary_reconnect_max in [ext-server].
+SECONDARY_RECONNECT_MIN = 5
+SECONDARY_RECONNECT_MAX = 60
+
 # main class
 class OCPP2WProxy:
     # Static dict of OCPP2WProxy instances. key is charger_id
@@ -67,22 +72,64 @@ class OCPP2WProxy:
             logger.error(f"Charger ID '{charger_id}' contains unsupported characters (allowed: letters, digits, - _ . : @ ~)")
             raise Exception("Charger ID contains unsupported characters")
 
-        # Initialize table of CSMS call ids sent to the charger in order to respond back 
+        # Initialize table of CSMS call ids sent to the charger in order to respond back
         self.primary_call_ids = set()
         self.secondary_call_ids = set()
+
+        # Upstream connections. The secondary one may be None at any time: it is
+        # optional, and it is re-established in the background when lost.
+        self.primary_connection = None
+        self.secondary_connection = None
+        self.secondary_url = None
+        self.secondary_task = None
+        self._connect_kwargs = {}
 
         # Insert new OCPP2WProxy instance in the (static) dict of instances.
         self.proxy_list[charger_id] = self
 
     async def close(self):
         """Close all connections to the charger and primary, secondary server"""
+        if self.secondary_task is not None:
+            self.secondary_task.cancel()
+        for connection in (self.ws, self.primary_connection, self.secondary_connection):
+            if connection is None:
+                continue
+            try:
+                await connection.close()
+            except Exception:
+                pass # Ignore exceptions
+
+    async def connect_secondary(self):
+        """Connect to the secondary server. Returns None (and logs) if that fails."""
         try:
-            await self.ws.close()
-            await self.primary_connection.close()
-            if self.secondary_connection:
-                await self.secondary_connection.close()
+            connection = await websockets.connect(uri=self.secondary_url, **self._connect_kwargs)
+            logger.info(f"{self.charger_id} Connected to secondary server @ {self.secondary_url}")
+            return connection
         except Exception as e:
-            pass # Ignore exceptions
+            logger.warning(f"{self.charger_id} Secondary server @ {self.secondary_url} not reachable ({e}). Continuing with primary only")
+            return None
+
+    async def secondary_loop(self):
+        """Keep the secondary connection alive.
+
+        Receives messages while connected and reconnects with backoff when the
+        connection is lost. Losing the secondary (e.g. Home Assistant restarting)
+        must never take down the charger's connection to the primary server."""
+        delay_min = config.getint("ext-server", "secondary_reconnect_min", fallback=SECONDARY_RECONNECT_MIN)
+        delay_max = config.getint("ext-server", "secondary_reconnect_max", fallback=SECONDARY_RECONNECT_MAX)
+        delay = delay_min
+        while True:
+            if self.secondary_connection is None:
+                logger.info(f"{self.charger_id} Retrying secondary server in {delay} seconds")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, delay_max)
+                self.secondary_connection = await self.connect_secondary()
+                continue
+            delay = delay_min
+            await self.receive_secondary_messages()
+            # Connection lost. Pending calls from the secondary can no longer be answered.
+            self.secondary_connection = None
+            self.secondary_call_ids.clear()
 
     @staticmethod
     async def check_delete_old(charger_id: str):
@@ -108,42 +155,34 @@ class OCPP2WProxy:
         subprotocol = self.ws.subprotocol or DEFAULT_SUBPROTOCOL
         logger.debug(f"{self.charger_id} using subprotocol {subprotocol}")
         primary_url = config.get("ext-server", "server") + "/" + self.charger_id
-        if config.has_option("ext-server", "secondary_server"):
-            secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
-        else:
-            secondary_url = None    
+        if config.get("ext-server", "secondary_server", fallback=""):
+            self.secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
+        self._connect_kwargs = dict(
+            user_agent_header=user_agent,
+            additional_headers=headers,
+            subprotocols=[subprotocol],
+        )
 
         try:
-            self.primary_connection = await websockets.connect(
-                uri=primary_url,
-                user_agent_header=user_agent,
-                additional_headers=headers,
-                subprotocols=[subprotocol],
-            )
-            logger.info(f"Connected to primary server @ {primary_url}")
+            self.primary_connection = await websockets.connect(uri=primary_url, **self._connect_kwargs)
+            logger.info(f"{self.charger_id} Connected to primary server @ {primary_url}")
 
-            # Connect to secondary server if it is enabled.
-            if secondary_url:
-                self.secondary_connection = await websockets.connect(
-                    uri=secondary_url,
-                    user_agent_header=user_agent,
-                    additional_headers=headers,
-                    subprotocols=[subprotocol],
-                )
-                logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
+            # Connect to secondary server if it is enabled. Failure is not fatal: the
+            # secondary loop keeps retrying in the background.
+            if self.secondary_url:
+                self.secondary_connection = await self.connect_secondary()
             else:
-                self.secondary_connection = None
                 logger.info(f"{self.charger_id} Secondary server not enabled")
-            
-            # Create tasks to handle the charger. Each task each to handle receiving messages from
-            # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
-            # connections if connection goes stale.
+
+            # Create tasks to handle the charger. One task each to handle receiving messages
+            # from the charger and from the primary CSMS. These two decide the lifetime of
+            # this proxy session. The secondary CSMS runs in its own loop that may come and go.
             self._last_charger_update = time.time()
             self.tasks = []
             self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
             self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
-            if self.secondary_connection is not None:
-                self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
+            if self.secondary_url:
+                self.secondary_task = asyncio.create_task(self.secondary_loop())
             #self.tasks.append(asyncio.create_task(self.watchdog()))
 
             # Wait for tasks to complete
@@ -158,6 +197,8 @@ class OCPP2WProxy:
             # Cancel any remaining tasks
             for task in pending:
                 task.cancel()
+            if self.secondary_task is not None:
+                self.secondary_task.cancel()
 
         except websockets.exceptions.InvalidURI:
             logger.error(f"{self.charger_id} Invalid URI")
@@ -189,8 +230,7 @@ class OCPP2WProxy:
                 # If it is a Call (2), we will send it to both primary and secondary (if connected)
                 if message_type == OCPPMessageType.Call:
                     await self.primary_connection.send(message)
-                    if self.secondary_connection:
-                        await self.secondary_connection.send(message)
+                    await self.send_to_secondary(message)
                 elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
                     if message_id in self.primary_call_ids:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
@@ -199,13 +239,25 @@ class OCPP2WProxy:
                     elif message_id in self.secondary_call_ids:
                         logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
                         self.secondary_call_ids.remove(message_id)
-                        await self.secondary_connection.send(message)
+                        await self.send_to_secondary(message)
                     else:
                         logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
                 else:
                     logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
         except Exception as e:
             logger.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
+
+    async def send_to_secondary(self, message: str):
+        """Send a message to the secondary server, if connected. Never raises:
+        the secondary is best effort and must not disturb the primary path."""
+        connection = self.secondary_connection
+        if connection is None:
+            logger.debug(f"{self.charger_id} Secondary not connected, message not forwarded")
+            return
+        try:
+            await connection.send(message)
+        except Exception as e:
+            logger.warning(f"{self.charger_id} Could not forward message to secondary ({e})")
 
     async def receive_primary_messages(self):
         try:
@@ -225,10 +277,11 @@ class OCPP2WProxy:
             logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
 
     async def receive_secondary_messages(self):
+        connection = self.secondary_connection
         try:
             while True:
                 # Wait for a message from the secondary server
-                message = await self.secondary_connection.recv()
+                message = await connection.recv()
                 logger.info(f"{self.charger_id} v (sec) : {message}")
 
                 [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
@@ -239,6 +292,8 @@ class OCPP2WProxy:
                     await self.ws.send(message) 
                 # Note! We do not forward CallResults or CallErrors from the secondary server
                 # These are silently ignored.
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info(f"{self.charger_id} Secondary connection closed ({e}). Will reconnect")
         except Exception as e:
             logger.error(f"{self.charger_id} Error in receive_secondary_messages: {e}")
 
