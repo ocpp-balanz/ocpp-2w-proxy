@@ -46,6 +46,8 @@ DEFAULT_SUBPROTOCOL = "ocpp1.6"
 # ini file via secondary_reconnect_min / secondary_reconnect_max in [ext-server].
 SECONDARY_RECONNECT_MIN = 5
 SECONDARY_RECONNECT_MAX = 60
+# A secondary connection that lasted at least this long resets the backoff.
+SECONDARY_STABLE_SECONDS = 60
 
 # main class
 class OCPP2WProxy:
@@ -125,11 +127,17 @@ class OCPP2WProxy:
                 delay = min(delay * 2, delay_max)
                 self.secondary_connection = await self.connect_secondary()
                 continue
-            delay = delay_min
+            connected_at = time.time()
             await self.receive_secondary_messages()
             # Connection lost. Pending calls from the secondary can no longer be answered.
             self.secondary_connection = None
             self.secondary_call_ids.clear()
+            # Only go back to the short delay after a connection that actually lasted.
+            # The Home Assistant OCPP integration accepts and immediately closes the
+            # connection of a charger that is not configured yet; without this check
+            # we would knock on its door every delay_min seconds.
+            if time.time() - connected_at >= SECONDARY_STABLE_SECONDS:
+                delay = delay_min
 
     @staticmethod
     async def check_delete_old(charger_id: str):
